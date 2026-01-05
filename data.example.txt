@@ -1,0 +1,8 @@
+# Example veteran data
+# Format: FirstName|LastName|Branch|BirthDate|DischargeDate
+# DischargeDate should be within last 12 months for best results
+
+# Examples:
+John|Smith|Army|1985-03-15|2024-06-01
+Jane|Doe|Navy|1990-07-22|2024-08-15
+Mike|Johnson|Air Force|1988-11-30|2024-03-20

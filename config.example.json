@@ -1,0 +1,19 @@
+{
+    "accessToken": "YOUR_CHATGPT_ACCESS_TOKEN_HERE",
+    "programId": "690415d58971e73ca187d8c9",
+    "email": {
+        "imap_server": "mail.yourdomain.com",
+        "imap_port": 993,
+        "email_address": "verify@yourdomain.com",
+        "email_password": "your_email_password",
+        "use_ssl": true
+    },
+    "settings": {
+        "max_retries": 3,
+        "retry_delay": 2,
+        "email_poll_interval": 5,
+        "email_max_attempts": 24,
+        "request_timeout": 30,
+        "delay_between_records": 2
+    }
+}

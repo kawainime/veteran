@@ -1,0 +1,26 @@
+# Veterans Verification CLI - Dependencies
+
+# HTTP clients
+requests>=2.31.0
+httpx>=0.27.0
+
+# Cloudflare bypass (recommended)
+cloudscraper>=1.2.71
+
+# Rich terminal UI
+rich>=13.7.0
+
+# CLI framework
+click>=8.1.7
+
+# Async support
+aiohttp>=3.9.0
+
+# Email parsing
+python-dateutil>=2.8.2
+
+# Validation
+pydantic>=2.5.0
+
+# Optional: SOCKS proxy support
+# PySocks>=1.7.1

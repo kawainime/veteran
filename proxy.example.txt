@@ -1,0 +1,12 @@
+# Example proxy list
+# Supported formats:
+# host:port
+# host:port:user:pass
+# http://host:port
+# http://user:pass@host:port
+# socks5://host:port
+
+# Uncomment and add your proxies:
+# 192.168.1.100:8080
+# proxy.example.com:3128:username:password
+# http://user:pass@premium-proxy.com:8080

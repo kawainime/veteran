@@ -1,0 +1,14 @@
+# Veterans data scraped from VA.gov Veterans Legacy Memorial
+# Generated: 2026-01-04T03:34:24.034871
+# Format: FirstName|LastName|Branch|BirthDate|DischargeDate
+
+David|Obannon|Army|1963-01-01|2025-08-01
+Kenneth|Obarr|Army|1942-01-01|2025-06-01
+Daniel|Obrien|Army|1952-01-01|2025-06-01
+Denis|Obrien|Army|1951-01-01|2025-08-01
+Dennis|Obrien|Army|1942-01-01|2025-03-01
+Dennis|Obrien|Army|1947-01-01|2025-07-01
+George|Obrien|Army|1924-01-01|2025-09-01
+John|Obrien|Army|1946-01-01|2025-02-01
+John|Obrien|Army|1947-01-01|2025-04-01
+John|Obrien|Army|1970-01-01|2025-06-01
