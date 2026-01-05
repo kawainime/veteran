@@ -1,646 +1,359 @@
 #!/usr/bin/env python3
 """
-Veterans Verification CLI - Main Entry Point
-
-An improved CLI tool for ChatGPT Plus US Veterans verification via SheerID.
-
-Usage:
-    python main.py [OPTIONS]
-
-Examples:
-    python main.py                          # Run with defaults (data.txt)
-    python main.py --live --year 2025       # Live scrape 2025 deaths
-    python main.py --live --letters A,B,C   # Scrape specific letters
-    python main.py --proxy http://...       # With proxy
-    python main.py --single "John|Doe|..."  # Single record
-    python main.py -v                       # Verbose mode
+Veterans Verification CLI (Standalone Version)
+Repaired for Ubuntu 24.04 - Removes 'src' dependency.
 """
 
 import sys
+import json
 import time
 import random
+import requests
 from pathlib import Path
-from datetime import date, timedelta
+from datetime import datetime, date, timedelta
+from typing import List, Dict, Optional, Generator, Union
+from dataclasses import dataclass, asdict
 
-# Add src to path
-sys.path.insert(0, str(Path(__file__).parent))
+# Try to import external libraries
+try:
+    import click
+    import cloudscraper
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+    HAS_DEPS = True
+except ImportError:
+    HAS_DEPS = False
+    print("CRITICAL ERROR: Missing dependencies.")
+    print("Please run: pip install click cloudscraper rich requests")
+    sys.exit(1)
 
-import click
+# ==========================================
+# 1. UTILS & CONFIG (Replaces src.utils/config)
+# ==========================================
 
-from src.config import ConfigManager, Config
-from src.data_parser import DataParser, VeteranData
-from src.utils import ProxyManager, DeduplicationTracker, format_duration
-from src.verifier import VerificationOrchestrator, VerificationStatus
-from src.ui import ConsoleUI, create_simple_progress_callback, create_request_log_callback
+class ConsoleUI:
+    """Handles console output."""
+    def __init__(self, verbose=False):
+        self.console = Console()
+        self.verbose = verbose
 
+    def print_banner(self):
+        self.console.print(Panel(
+            "[bold cyan]Veterans Verification CLI (Standalone)[/bold cyan]\n"
+            "[dim]Repaired Version - Scraper & Token Checker Active[/dim]",
+            title="System Ready",
+            border_style="green"
+        ))
 
-def generate_fake_discharge_date() -> str:
-    """
-    Generate a fake discharge date that is:
-    - Within the current month
-    - Before or equal to today
-    - Random day between 1 and today's day
+    def print_error(self, msg, title="Error"):
+        self.console.print(Panel(f"[bold red]{msg}[/bold red]", title=title, border_style="red"))
+
+    def print_success(self, msg):
+        self.console.print(f"[bold green]✅ {msg}[/bold green]")
+
+    def print_info(self, msg):
+        self.console.print(f"[cyan]ℹ️ {msg}[/cyan]")
+
+    def print_warning(self, msg):
+        self.console.print(f"[yellow]⚠️ {msg}[/yellow]")
+
+class ConfigManager:
+    """Manages configuration loading."""
+    @staticmethod
+    def load(path: str) -> dict:
+        p = Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f"Config file {path} not found")
+        with open(p, 'r') as f:
+            return json.load(f)
+
+class ProxyManager:
+    """Simple proxy manager."""
+    def __init__(self, proxies: List[str]):
+        self.proxies = proxies
+        self.current_idx = 0
+
+    @classmethod
+    def from_file(cls, path: Path):
+        if not path.exists():
+            return cls([])
+        with open(path) as f:
+            proxies = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+        return cls(proxies)
+
+    def get_current(self) -> Optional[str]:
+        if not self.proxies: return None
+        return self.proxies[self.current_idx % len(self.proxies)]
+
+    def get_next(self) -> Optional[str]:
+        if not self.proxies: return None
+        self.current_idx += 1
+        return self.get_current()
+
+    def __len__(self):
+        return len(self.proxies)
+
+# ==========================================
+# 2. DATA MODELS (Replaces src.data_parser)
+# ==========================================
+
+@dataclass
+class VeteranData:
+    first_name: str
+    last_name: str
+    branch: str
+    birth_date: str
+    discharge_date: str
+    organization: str = "NA"
     
-    This ensures the discharge is "within 12 months" as required by SheerID.
-    """
-    today = date.today()
-    
-    # Random day between 1 and today's day (not future)
-    if today.day > 1:
-        random_day = random.randint(1, today.day - 1)
-    else:
-        # If today is the 1st, use last month
-        last_month = today - timedelta(days=1)
-        random_day = random.randint(1, last_month.day)
-        return last_month.replace(day=random_day).strftime("%Y-%m-%d")
-    
-    return today.replace(day=random_day).strftime("%Y-%m-%d")
+    @property
+    def full_name(self):
+        return f"{self.first_name} {self.last_name}"
 
-
-def get_base_path() -> Path:
-    """Get the base path for config and data files."""
-    return Path(__file__).parent
-
-
-@click.command()
-@click.option(
-    "--proxy",
-    type=str,
-    help="Proxy URL (e.g., http://user:pass@host:port)",
-)
-@click.option(
-    "--proxy-file",
-    type=click.Path(exists=True),
-    help="Load proxies from file",
-)
-@click.option(
-    "--no-dedup",
-    is_flag=True,
-    help="Disable deduplication check",
-)
-@click.option(
-    "--single",
-    type=str,
-    help='Single record: "FirstName|LastName|Branch|DOB|DischargeDate"',
-)
-@click.option(
-    "-v", "--verbose",
-    is_flag=True,
-    help="Verbose output",
-)
-@click.option(
-    "--dry-run",
-    is_flag=True,
-    help="Validate data without submitting",
-)
-@click.option(
-    "--max-retries",
-    type=int,
-    default=3,
-    help="Maximum retry attempts per request",
-)
-@click.option(
-    "--delay",
-    type=float,
-    default=0.5,
-    help="Delay between records in seconds",
-)
-@click.option(
-    "--config",
-    "config_file",
-    type=str,
-    default="config.json",
-    help="Config file path",
-)
-@click.option(
-    "--data",
-    "data_file",
-    type=str,
-    default="data.txt",
-    help="Data file path",
-)
-@click.option(
-    "--stop-on-success",
-    is_flag=True,
-    default=True,
-    help="Stop after first successful verification",
-)
-@click.option(
-    "--continue-on-success",
-    is_flag=True,
-    help="Continue processing after success",
-)
-@click.option(
-    "--retry-until-success",
-    is_flag=True,
-    help="Keep retrying all records until one succeeds",
-)
-@click.option(
-    "--max-rounds",
-    type=int,
-    default=0,
-    help="Maximum retry rounds (0=unlimited, only with --retry-until-success)",
-)
-@click.option(
-    "--live",
-    is_flag=True,
-    help="Live scrape data from VA.gov instead of using data.txt",
-)
-@click.option(
-    "--year",
-    "scrape_year",
-    type=str,
-    default="2025",
-    help="Year of death to scrape (for --live mode)",
-)
-@click.option(
-    "--letters",
-    "scrape_letters",
-    type=str,
-    default="A",
-    help="Letters to scrape, comma-separated (e.g., A,B,C or A-Z)",
-)
-@click.option(
-    "--branch",
-    "scrape_branch",
-    type=str,
-    default="NA",
-    help="Branch filter for scraping (Army, Navy, etc. or NA for all)",
-)
-@click.option(
-    "--limit-per-letter",
-    type=int,
-    default=50,
-    help="Max records per letter when scraping",
-)
-@click.option(
-    "--source",
-    "scrape_source",
-    type=click.Choice(["vlm", "anc"], case_sensitive=False),
-    default="anc",
-    help="Data source for --live mode: vlm (VA Legacy Memorial) or anc (Arlington National Cemetery, default)",
-)
-@click.option(
-    "--auto-reset",
-    is_flag=True,
-    help="Auto reset verification ID when locked (uses browser automation)",
-)
-@click.option(
-    "--no-headless",
-    is_flag=True,
-    help="Show browser window during auto-reset (for debugging)",
-)
-@click.option(
-    "--cookies",
-    "cookies_file",
-    type=str,
-    help="Path to cookies.json file exported from browser (for auto-reset)",
-)
-@click.option(
-    "--rotate-proxy",
-    is_flag=True,
-    help="Rotate proxy for each verification attempt",
-)
-@click.option(
-    "--fake-dod",
-    is_flag=True,
-    help="Use fake discharge date (within current month, before today) to meet 12-month requirement",
-)
-def main(
-    proxy: str,
-    proxy_file: str,
-    no_dedup: bool,
-    single: str,
-    verbose: bool,
-    dry_run: bool,
-    max_retries: int,
-    delay: float,
-    config_file: str,
-    data_file: str,
-    stop_on_success: bool,
-    continue_on_success: bool,
-    retry_until_success: bool,
-    max_rounds: int,
-    live: bool,
-    scrape_year: str,
-    scrape_letters: str,
-    scrape_branch: str,
-    limit_per_letter: int,
-    scrape_source: str,
-    auto_reset: bool,
-    no_headless: bool,
-    cookies_file: str,
-    rotate_proxy: bool,
-    fake_dod: bool,
-):
-    """
-    Veterans Verification CLI - US Veterans verification for ChatGPT Plus.
-    
-    Automates the SheerID verification process using veteran data.
-    """
-    base_path = get_base_path()
-    ui = ConsoleUI(verbose=verbose)
-    
-    # Print banner
-    ui.print_banner()
-    
-    # Load configuration
-    config_manager = ConfigManager(base_path)
-    
-    if not config_manager.config_exists(config_file):
-        ui.print_error(
-            f"Config file '{config_file}' not found!\n\n"
-            "Create it by copying config.example.json:\n"
-            f"  cp config.example.json {config_file}\n\n"
-            "Then edit it with your credentials.",
-            title="Configuration Missing"
+class DataParser:
+    @staticmethod
+    def parse_line(line: str) -> Optional[VeteranData]:
+        parts = line.strip().split('|')
+        if len(parts) < 5:
+            return None
+        return VeteranData(
+            first_name=parts[0],
+            last_name=parts[1],
+            branch=parts[2],
+            birth_date=parts[3],
+            discharge_date=parts[4]
         )
-        sys.exit(1)
-    
-    try:
-        config = config_manager.load(config_file)
-    except Exception as e:
-        ui.print_error(f"Failed to load config: {e}")
-        sys.exit(1)
-    
-    # Validate configuration
-    valid, errors = config.is_valid()
-    if not valid:
-        ui.print_error(
-            "Configuration errors:\n" + "\n".join(f"  • {e}" for e in errors),
-            title="Invalid Configuration"
-        )
-        ui.print_token_expired_help()
-        sys.exit(1)
-    
-    # Override settings
-    if max_retries:
-        config.settings.max_retries = max_retries
-    if delay:
-        config.settings.delay_between_records = delay
-    
-    # Load proxies
-    proxy_manager = None
-    if proxy:
-        proxy_manager = ProxyManager([proxy])
-    elif proxy_file:
-        proxy_manager = ProxyManager.from_file(Path(proxy_file))
-    else:
-        default_proxy_file = base_path / "proxy.txt"
-        if default_proxy_file.exists():
-            proxy_manager = ProxyManager.from_file(default_proxy_file)
-    
-    # Load veteran records
-    records = []
-    live_scraper = None
-    
-    if single:
-        # Single record mode
-        record = DataParser.parse_line(single)
-        if not record:
-            ui.print_error(
-                "Invalid record format.\n"
-                'Expected: "FirstName|LastName|Branch|DOB|DischargeDate"\n'
-                'Example: "John|Smith|Army|1990-01-15|2024-06-01"'
-            )
-            sys.exit(1)
-        records = [record]
-    elif live:
-        # Live scraping mode - will scrape on-the-fly
-        # Parse letters
-        if "-" in scrape_letters:
-            # Range like A-Z
-            parts = scrape_letters.split("-")
-            if len(parts) == 2:
-                start, end = parts[0].upper(), parts[1].upper()
-                letters = "".join([chr(i) for i in range(ord(start), ord(end) + 1)])
-            else:
-                letters = scrape_letters.replace(",", "").upper()
-        else:
-            letters = scrape_letters.replace(",", "").upper()
-        
-        # Select scraper based on source
-        if scrape_source.lower() == "anc":
-            from src.anc_scraper import ANCExplorerScraper
+
+    @staticmethod
+    def parse_file(path: Path) -> List[VeteranData]:
+        records = []
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.strip() and not line.startswith('#'):
+                    rec = DataParser.parse_line(line)
+                    if rec: records.append(rec)
+        return records
+
+# ==========================================
+# 3. SCRAPER LOGIC (Ported from scraper.py)
+# ==========================================
+
+class VLMScraper:
+    """Ported directly from scraper.py to remove dependency."""
+    API_URL = "https://www.vlm.cem.va.gov/api/v1.1/gcio/profile/search/basic"
+    BRANCH_MAP = {
+        "US Army": "Army", "Army": "Army",
+        "US Navy": "Navy", "Navy": "Navy",
+        "US Air Force": "Air Force", "Air Force": "Air Force",
+        "US Marine Corps": "Marine Corps", "Marine Corps": "Marine Corps"
+    }
+
+    def __init__(self, delay=1.0, verbose=False):
+        self.delay = delay
+        self.verbose = verbose
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Content-Type": "application/json;charset=utf-8",
+            "Origin": "https://www.vlm.cem.va.gov"
+        })
+
+    def scrape_by_letters(self, letters, year="", limit=50):
+        """Scrape generator."""
+        console = Console()
+        for letter in letters.replace(",","").upper():
+            if self.verbose: console.log(f"Scraping letter: {letter}")
             
-            # ANC requires proxy
-            scraper_proxy = proxy
-            if not scraper_proxy and proxy_manager:
-                scraper_proxy = proxy_manager.get_current()
+            payload = {
+                "lastName": letter,
+                "yearOfDeath": year,
+                "limit": limit,
+                "page": 1
+            }
             
-            if not scraper_proxy:
-                ui.print_error("ANC Explorer requires a proxy. Use --proxy or --proxy-file")
-                sys.exit(1)
-            
-            ui.print_info(f"🔴 LIVE MODE: Arlington National Cemetery Explorer")
-            ui.print_info(f"   Year: {scrape_year} | Letters: {letters} | Limit: {limit_per_letter}/letter")
-            ui.print_info(f"   Source: [bold cyan]ANC[/bold cyan] (Real DOB & Branch data)")
-            
-            live_scraper = ANCExplorerScraper(
-                proxy=scraper_proxy,
-                delay=0.5,
-                verbose=verbose,
-                console=ui.console
-            )
-            live_scraper_type = "anc"
-        else:
-            from scraper import VLMScraper
-            
-            ui.print_info(f"🔴 LIVE MODE: Scraping VA.gov Veterans Legacy Memorial")
-            ui.print_info(f"   Year: {scrape_year} | Letters: {letters} | Branch: {scrape_branch} | Limit: {limit_per_letter}/letter")
-            
-            live_scraper = VLMScraper(delay=0.5, verbose=verbose)
-            live_scraper_type = "vlm"
-        # Records will be loaded on-the-fly
-    else:
-        # Load from file
-        data_path = base_path / data_file
-        if not data_path.exists():
-            ui.print_error(
-                f"Data file '{data_file}' not found!\n\n"
-                "Create it by copying data.example.txt:\n"
-                f"  cp data.example.txt {data_file}\n\n"
-                "Then add your veteran records.\n\n"
-                "Or use --live mode to scrape directly from VA.gov",
-                title="Data File Missing"
-            )
-            sys.exit(1)
-        
-        records = DataParser.parse_file(data_path)
-        
-        if not records:
-            ui.print_error("No valid records found in data file!")
-            sys.exit(1)
+            try:
+                resp = self.session.post(self.API_URL, json=payload, timeout=10)
+                if resp.status_code == 200:
+                    data = resp.json().get('response', {}).get('data', [])
+                    for profile in data:
+                        # Parsing Logic
+                        fname = profile.get('first_name', '').title()
+                        lname = profile.get('last_name', '').title()
+                        branch_raw = profile.get('service_branch_id', 'Army')
+                        branch = self.BRANCH_MAP.get(branch_raw, 'Army')
+                        death_date = profile.get('date_of_death', '')[:10]
+                        
+                        # Guess DOB (Death - 60 years roughly)
+                        try:
+                            dy = int(death_date[:4])
+                            birth_date = f"{dy-60}-01-01"
+                        except:
+                            birth_date = "1950-01-01"
+
+                        if fname and lname and death_date:
+                            yield VeteranData(fname, lname, branch, birth_date, death_date)
+                
+                time.sleep(self.delay)
+            except Exception as e:
+                if self.verbose: console.log(f"Error scraping {letter}: {e}")
+
+# ==========================================
+# 4. VERIFICATION LOGIC (Simplified)
+# ==========================================
+
+class TokenChecker:
+    """Replaces full Verifier since src is missing. Checks Token & ID creation."""
     
-    # Initialize deduplication tracker
-    dedup_tracker = None
-    if not no_dedup:
-        dedup_tracker = DeduplicationTracker(base_path / "used.txt")
-    
-    # Print configuration info
-    record_count_display = len(records) if records else f"LIVE ({letters})"
-    ui.print_config_info(
-        proxy_count=len(proxy_manager) if proxy_manager else 0,
-        record_count=len(records) if records else 0,
-        using_cloudscraper=True,
-        email_configured=config.email.is_valid(),
-    )
-    
-    if live:
-        ui.console.print(f"   [bold magenta]📡 Live Mode[/bold magenta]     Year={scrape_year} Letters={letters} Source={scrape_source.upper()}")
-    
-    if fake_dod:
-        ui.console.print(f"   [bold yellow]📅 Fake DOD[/bold yellow]      Using current month discharge date (within 12 months)")
-    
-    # Dry run mode
-    if dry_run:
-        if live:
-            ui.print_error("Dry run mode not supported with --live")
-            sys.exit(1)
-        ui.print_info("Dry run mode - validating records without submitting")
-        for i, record in enumerate(records, 1):
-            warnings = DataParser.validate_record(record)
-            status = "✅" if not warnings else "⚠️"
-            ui.console.print(f"[{i}] {status} {record.full_name} ({record.branch})")
-            for w in warnings:
-                ui.print_warning(f"    {w}")
-        return
-    
-    # Run verification
-    start_time = time.time()
-    success_count = 0
-    failed_count = 0
-    skipped_count = 0
-    round_count = 0
-    
-    current_proxy = proxy_manager.get_current() if proxy_manager else None
-    
-    # Retry until success loop
-    keep_trying = True
-    while keep_trying:
-        round_count += 1
-        if retry_until_success and round_count > 1:
-            ui.print_info(f"\n🔄 Round {round_count} - Retrying...")
-            if dedup_tracker:
-                dedup_tracker = DeduplicationTracker(base_path / "used.txt")
+    def __init__(self, config, proxy_manager=None):
+        self.token = config.get('accessToken')
+        self.scraper = cloudscraper.create_scraper()
+        self.proxy = proxy_manager.get_current() if proxy_manager else None
+
+    def check_token_and_create_id(self):
+        """Checks if token is valid by creating a Verification ID."""
+        url = 'https://chatgpt.com/backend-api/veterans/create_verification'
+        headers = {
+            'authorization': f'Bearer {self.token}',
+            'content-type': 'application/json',
+            'origin': 'https://chatgpt.com',
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+        proxies = {'http': self.proxy, 'https': self.proxy} if self.proxy else None
         
         try:
-            with VerificationOrchestrator(
-                config=config,
-                proxy=current_proxy,
-                on_progress=create_simple_progress_callback(ui) if verbose else lambda x: None,
-                on_request_log=create_request_log_callback(ui, verbose),
-            ) as orchestrator:
-                
-                # Determine record source
-                if live:
-                    # Live scraping mode - stream records
-                    if live_scraper_type == "anc":
-                        record_generator = live_scraper.scrape_by_letters(
-                            letters=letters,
-                            year=scrape_year,
-                            max_per_letter=limit_per_letter,
-                        )
-                    else:
-                        record_generator = live_scraper.scrape_all(
-                            letters=letters,
-                            year_of_death=scrape_year,
-                            branch=scrape_branch,
-                            max_per_letter=limit_per_letter,
-                        )
-                    total_records = "LIVE"
-                    record_iter = enumerate(record_generator, 1)
-                else:
-                    total_records = len(records)
-                    record_iter = enumerate(records, 1)
-                
-                for i, scraped_record in record_iter:
-                    # Convert scraped record to VeteranData if from live scraper
-                    if live:
-                        line = scraped_record.to_verification_format()
-                        record = DataParser.parse_line(line)
-                        if not record:
-                            continue
-                    else:
-                        record = scraped_record
-                    
-                    # Apply fake discharge date if enabled
-                    if fake_dod:
-                        fake_discharge = generate_fake_discharge_date()
-                        record = VeteranData(
-                            first_name=record.first_name,
-                            last_name=record.last_name,
-                            branch=record.branch,
-                            birth_date=record.birth_date,
-                            discharge_date=fake_discharge,
-                            organization=record.organization,
-                        )
-                        if verbose:
-                            ui.console.print(f"   [dim]📅 Fake DOD: {fake_discharge}[/dim]")
-                    
-                    # Check deduplication
-                    if dedup_tracker and dedup_tracker.is_used(
-                        record.first_name, record.last_name, record.birth_date
-                    ):
-                        if not retry_until_success:
-                            ui.print_record_start(i, total_records, record)
-                            ui.console.print("   [yellow]⏭️ SKIPPED[/yellow] Already processed")
-                            skipped_count += 1
-                        continue
-                    
-                    # Validate record
-                    warnings = DataParser.validate_record(record)
-                    for w in warnings:
-                        if verbose:
-                            ui.print_warning(w)
-                    
-                    # Rotate proxy if enabled
-                    if rotate_proxy and proxy_manager:
-                        current_proxy = proxy_manager.get_next()
-                        orchestrator.set_proxy(current_proxy)
-                        if verbose:
-                            proxy_short = current_proxy[:40] + "..." if len(current_proxy) > 40 else current_proxy
-                            ui.console.print(f"   [dim]🔄 Proxy: {proxy_short}[/dim]")
-                    
-                    # Print record start
-                    ui.print_record_start(i, total_records, record)
-                    
-                    # Run verification
-                    result = orchestrator.verify(record)
-                    
-                    # Mark as used
-                    if dedup_tracker and result.status != VerificationStatus.ERROR:
-                        dedup_tracker.mark_used(
-                            record.first_name, record.last_name, record.birth_date
-                        )
-                    
-                    # Print result
-                    ui.print_result(result)
-                    
-                    # Update counters
-                    if result.status == VerificationStatus.SUCCESS:
-                        success_count += 1
-                        ui.print_success_banner(result)
-                        keep_trying = False  # Stop retry loop on success
-                        
-                        if not continue_on_success and stop_on_success:
-                            ui.print_info("Stopping after successful verification")
-                            break
-                    
-                    elif result.status == VerificationStatus.TOKEN_EXPIRED:
-                        failed_count += 1
-                        ui.print_token_expired_help()
-                        keep_trying = False  # Can't continue without valid token
-                        break
-                    
-                    elif result.status == VerificationStatus.ERROR:
-                        failed_count += 1
-                        # Check if it's a verification ID error that can be auto-reset
-                        error_code = result.details.get("error") if result.details else None
-                        can_auto_reset = error_code in ("verification_id_reused", "verification_in_error_state")
-                        
-                        if can_auto_reset and auto_reset:
-                            ui.print_warning("🔄 Verification ID locked - attempting auto-reset...")
-                            from src.browser_reset import reset_via_api, reset_verification, HAS_PLAYWRIGHT
-                            
-                            # Try API reset first (faster)
-                            reset_success, new_vid, reset_msg = reset_via_api(
-                                config.access_token,
-                                proxy=current_proxy
-                            )
-                            
-                            if reset_success:
-                                ui.print_success(f"✅ API Reset: {reset_msg}")
-                                VerificationOrchestrator.reset_failed_ids()
-                                continue  # Retry this record
-                            
-                            # If API reset failed, try browser
-                            if HAS_PLAYWRIGHT:
-                                ui.print_warning("API reset failed, trying browser automation...")
-                                # Look for cookies file in base path if not specified
-                                cookies_path = cookies_file
-                                if not cookies_path:
-                                    default_cookies = base_path / "cookies.json"
-                                    if default_cookies.exists():
-                                        cookies_path = str(default_cookies)
-                                
-                                reset_success, new_vid, reset_msg = reset_verification(
-                                    config.access_token,
-                                    headless=not no_headless,
-                                    proxy=current_proxy,
-                                    cookies_file=cookies_path
-                                )
-                                
-                                if reset_success:
-                                    ui.print_success(f"✅ Browser Reset: {reset_msg}")
-                                    VerificationOrchestrator.reset_failed_ids()
-                                    continue  # Retry this record
-                                else:
-                                    ui.print_error(f"Browser reset failed: {reset_msg}")
-                            else:
-                                ui.print_warning("Playwright not installed. Run: pip install playwright && playwright install chromium")
-                        
-                        if can_auto_reset:
-                            ui.print_error(
-                                "🔴 Verification ID tidak berubah!\n\n"
-                                "ChatGPT API mengembalikan ID yang SAMA yang sudah dalam state error.\n\n"
-                                "SOLUSI:\n"
-                                "1. Buka browser: https://chatgpt.com/veterans-claim\n"
-                                "2. Klik 'Verify Eligibility' untuk reset\n"
-                                "3. Jalankan tool ini lagi\n"
-                                "4. Atau gunakan --auto-reset untuk auto reset\n",
-                                title="Verification ID Locked"
-                            )
-                            keep_trying = False
-                            break
-                    
-                    elif result.status == VerificationStatus.FAILED:
-                        failed_count += 1
-                    
-                    elif result.status == VerificationStatus.SKIPPED:
-                        skipped_count += 1
-                    
-                    # Delay between records
-                    if not live or i % 10 != 0:  # Less delay info for live mode
-                        time.sleep(config.settings.delay_between_records)
-                
-                # End of records - check if we should retry
-                if not retry_until_success or success_count > 0:
-                    keep_trying = False
-                elif retry_until_success and success_count == 0:
-                    # Check max rounds limit
-                    if max_rounds > 0 and round_count >= max_rounds:
-                        ui.print_warning(f"Reached maximum rounds ({max_rounds}). Stopping.")
-                        keep_trying = False
-                    else:
-                        rounds_info = f" (max: {max_rounds})" if max_rounds > 0 else " (unlimited)"
-                        ui.print_warning(f"Round {round_count} complete - No success yet{rounds_info}. Retrying in 5 seconds...")
-                        time.sleep(5)
-        
-        except KeyboardInterrupt:
-            ui.print_warning("\nInterrupted by user")
-            keep_trying = False
-        
-        except Exception as e:
-            ui.print_error(f"Unexpected error: {e}")
-            if verbose:
-                import traceback
-                traceback.print_exc()
-            if not retry_until_success:
-                keep_trying = False
+            resp = self.scraper.post(
+                url, 
+                json={'program_id': '690415d58971e73ca187d8c9'}, # Veterans program ID
+                headers=headers,
+                proxies=proxies,
+                timeout=15
+            )
+            
+            if resp.status_code == 200:
+                vid = resp.json().get('verification_id')
+                return True, f"Token Valid! Verification ID created: {vid}"
+            elif resp.status_code == 401:
+                return False, "Token Expired (401)"
+            elif resp.status_code == 403:
+                return False, "Access Forbidden (403) - Try Proxy or Cloudflare issue"
             else:
-                ui.print_warning("Error occurred. Retrying in 10 seconds...")
-                time.sleep(10)
-    
-    # Print summary
-    total_time = time.time() - start_time
-    ui.print_summary(
-        success=success_count,
-        failed=failed_count,
-        skipped=skipped_count,
-        total_time=total_time,
-    )
+                return False, f"Error {resp.status_code}: {resp.text[:50]}"
+                
+        except Exception as e:
+            return False, f"Connection Error: {str(e)}"
 
+# ==========================================
+# 5. MAIN ENTRY POINT
+# ==========================================
+
+@click.command()
+@click.option("--config", default="config.json", help="Config file")
+@click.option("--data", default="data.txt", help="Data file")
+@click.option("--proxy", help="Proxy URL")
+@click.option("--live", is_flag=True, help="Live Scrape Mode")
+@click.option("--letters", default="A", help="Letters to scrape (Live mode)")
+@click.option("--year", default="2024", help="Year to scrape (Live mode)")
+@click.option("--verbose", is_flag=True, help="Verbose output")
+def main(config, data, proxy, live, letters, year, verbose):
+    """
+    All-in-One Veterans Tool (Ubuntu 24 Compatible).
+    Can Scrape Data and Check Token Validity.
+    """
+    ui = ConsoleUI(verbose)
+    ui.print_banner()
+
+    # 1. Load Config
+    try:
+        conf = ConfigManager.load(config)
+        token_short = conf.get('accessToken', '')[:10] + "..."
+        ui.print_info(f"Loaded config. Token: {token_short}")
+    except Exception as e:
+        ui.print_error(f"Config Error: {e}")
+        return
+
+    # 2. Setup Proxy
+    pm = ProxyManager([proxy]) if proxy else None
+    if proxy: ui.print_info(f"Using Proxy: {proxy}")
+
+    # 3. Check Token
+    ui.console.rule("[bold]Checking Access Token[/bold]")
+    checker = TokenChecker(conf, pm)
+    valid, msg = checker.check_token_and_create_id()
+    
+    if valid:
+        ui.print_success(msg)
+    else:
+        ui.print_error(msg)
+        ui.print_warning("Please update accessToken in config.json")
+        if not live: return # Stop if not just scraping
+
+    # 4. Process Data (Scrape or Load)
+    ui.console.rule("[bold]Processing Data[/bold]")
+    
+    records = []
+    
+    if live:
+        ui.print_info(f"Starting Live Scraper (Year: {year}, Letters: {letters})")
+        scraper = VLMScraper(verbose=verbose)
+        
+        # Output file
+        out_file = Path(f"scraped_data_{int(time.time())}.txt")
+        
+        with open(out_file, 'w') as f:
+            # Header
+            f.write(f"# Scraped Data {datetime.now()}\n")
+            
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=ui.console
+            ) as progress:
+                task = progress.add_task("Scraping...", total=None)
+                
+                count = 0
+                for rec in scraper.scrape_by_letters(letters, year):
+                    records.append(rec)
+                    line = f"{rec.first_name}|{rec.last_name}|{rec.branch}|{rec.birth_date}|{rec.discharge_date}"
+                    f.write(line + "\n")
+                    f.flush()
+                    count += 1
+                    progress.update(task, description=f"Found: {count} veterans ({rec.full_name})")
+                    
+        ui.print_success(f"Scraping Complete. Saved {len(records)} records to {out_file}")
+        
+    else:
+        # Load from file
+        try:
+            records = DataParser.parse_file(Path(data))
+            ui.print_info(f"Loaded {len(records)} records from {data}")
+        except Exception as e:
+            ui.print_error(f"Failed to load data: {e}")
+
+    # 5. Verification Stub
+    if records and valid:
+        ui.console.rule("[bold red]VERIFICATION MODULE MISSING[/bold red]")
+        ui.print_warning(
+            "The full auto-verification logic (SheerID submission) was located in the 'src' folder\n"
+            "which is missing from your installation.\n\n"
+            "This script has successfully:\n"
+            "1. Verified your ChatGPT Token works.\n"
+            "2. Loaded/Scraped Veteran Data.\n\n"
+            "To proceed with verification, you need to manually submit this data or\n"
+            "redownload the full repository using 'git clone'."
+        )
+        
+        # Show sample data to prove it works
+        table = Table(title="Sample Data Ready for Use")
+        table.add_column("First Name")
+        table.add_column("Last Name")
+        table.add_column("Discharge")
+        
+        for r in records[:5]:
+            table.add_row(r.first_name, r.last_name, r.discharge_date)
+        
+        ui.console.print(table)
 
 if __name__ == "__main__":
     main()
